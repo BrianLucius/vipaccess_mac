@@ -1,0 +1,8 @@
+# Swift Package Manager build output
+.build/
+
+# Assembled app bundle / distribution artifacts
+build/
+
+# macOS
+.DS_Store
