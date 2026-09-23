@@ -26,6 +26,9 @@ this (after a one-time "Always Allow").
 - `make dmg-dev` → `build/VIPAccess-dev.dmg` with a "drag to Applications" layout. This calls `scripts_make_dmg.sh`, which stages the app + an `/Applications` symlink, mounts a read-write DMG, arranges icon positions via AppleScript (cosmetic steps wrapped in `try` so Finder quirks don't abort), then converts to a compressed read-only DMG.
 - Both packages are not notarized, so the first launch triggers Gatekeeper. Peers either right-click → Open once, or run `xattr -dr com.apple.quarantine "/Applications/VIP Access.app"`.
 
+### Debug migration toggles ship in these packages
+`LegacyKeychainReader` honors two env-gated toggles used to validate the migration failure/hint paths (see gotcha #12): `VIPACCESS_DEBUG_FORCE_CLI_FAILURE` and `VIPACCESS_DEBUG_FORCE_MIGRATION_FAILURE`. They are **currently present in the release binary** (so validation uses the exact package peers receive) but are inert unless launched with the variable set. To validate: `VIPACCESS_DEBUG_FORCE_MIGRATION_FAILURE=1 "build/VIP Access.app/Contents/MacOS/VIPAccess"` (launch from the executable — Finder double-click does not inherit the env var). Wrap them in `#if DEBUG` if you ever want them compiled out of distributed builds.
+
 ## Full Developer ID distribution (paid Apple account, optional)
 - `make sign DEVELOPER_ID="Developer ID Application: Name (TEAMID)"` — hardened-runtime sign using `VIPAccess/VIPAccess.entitlements`.
 - `make distribute APPLE_ID=... TEAM_ID=...` — full `sign → dmg → notarize → staple` pipeline.

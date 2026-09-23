@@ -22,7 +22,7 @@ symptom, root cause, and the fix that is currently in place.
 ## 3. CLI-first keychain unlock avoids the auth dialog
 - **Symptom:** On macOS Tahoe, the deprecated `SecKeychainUnlock` triggered a system authorization dialog even when given the correct password programmatically.
 - **Root cause:** Tahoe gates file-based keychain access through UI.
-- **Fix:** `readCredential()` runs the `/usr/bin/security unlock-keychain` + `find-generic-password` CLI path FIRST; the deprecated `SecKeychain*` APIs are the fallback. If the fallback runs, `showKeychainPasswordHint(_:)` shows the derived password and copies it to the clipboard so the user can paste it into the system dialog.
+- **Fix:** `readCredential()` runs the `/usr/bin/security unlock-keychain` + `find-generic-password` CLI path FIRST; the deprecated `SecKeychain*` APIs are the fallback. If the fallback runs, `showKeychainPasswordHint(_:title:body:)` shows the derived password and copies it to the clipboard so the user can paste it into the system dialog. See gotchas #10–#12 for the hardening this hint required.
 
 ## 4. `keychain-access-groups` is FATAL with self-signed certs — do not add it
 - **Symptom:** App refused to launch at all ("The application can't be opened"). AMFI log: "Code has restricted entitlements, but the validation of its code signature failed. No matching profile found. Unsatisfied Entitlements: keychain-access-groups".
@@ -50,3 +50,35 @@ symptom, root cause, and the fix that is currently in place.
 
 ## 9. Case-insensitive APFS: `VIPAccess/` vs `vipaccess/`
 - During the original build the Swift project lived alongside the Python package on a case-insensitive volume, so `VIPAccess/` and `vipaccess/` resolved to the same directory. The projects are now separated (`~/Repositories/vipaccess/`), but keep this in mind if paths ever look surprising.
+
+## 10. The keychain password hint deadlocks / is invisible without care (`LegacyKeychainReader.swift`)
+Two separate bugs made the migration password hint fail to appear for testers. Both are fixed in `showKeychainPasswordHint(_:title:body:)`; keep all three guards if you touch it.
+- **Deadlock:** The hint originally called `DispatchQueue.main.sync { … }` unconditionally. `loadCredential()` used to run on the main thread (from the `MenuBarExtra` label's `.onAppear`), so the self-dispatch deadlocked and the alert never ran. **Fix:** the presenter checks `Thread.isMainThread` — runs the alert directly (via `MainActor.assumeIsolated`) when already on main, and only uses `DispatchQueue.main.sync` from a background thread. Also see gotcha #11 (the load now runs off-main anyway).
+- **Invisible alert (the one that actually bit a tester):** the derivation was correct and the hint code ran, but the `NSAlert` never appeared. This is an `LSUIElement` (menu-bar-only) app, so a modal alert shown WITHOUT `NSApp.activate(ignoringOtherApps: true)` is ordered *behind* the frontmost app and the user never sees it. Every other UI entry point (`MenuBarContentView` "Show Window"/"Enable Paste Service", `TokenWindowView` tap) already activates first — the hint was the one place missing it. **Fix:** the presenter calls `NSApp.activate(ignoringOtherApps: true)`, sets `alert.window.level = .modalPanel`, and `makeKeyAndOrderFront(nil)` before `runModal()`.
+- **Rule:** any modal surfaced from this app MUST activate the app first, or it can render invisibly.
+
+## 11. Migration hint must fire on ANY failure, and the keychain read must be off-main
+- **Symptom / design flaw:** the hint was wired only into the `catch` around the CLI path, so it fired for a narrow branch and not for failures elsewhere (`locateKeychainFile`, `getSerialNumber`, decryption, parse). A tester hit a failure that produced no hint at all.
+- **Fix:** `readCredential()` wraps the whole read/decrypt sequence in an outer `do/catch`. On ANY throw after the derived password is computed, it shows a "Manual Keychain Unlock Needed" alert containing the derived password (also copied to clipboard) plus the exact `security unlock-keychain "<path>"` command, then rethrows so the caller still sees the underlying error. The original up-front hint before the deprecated fallback is preserved.
+- **Off-main load:** `TokenViewModel.loadCredential()` now dispatches the blocking keychain read (CLI `Process` calls + possible modal) to a background queue via a checked continuation and applies the `Result` back on the `@MainActor`. Because the load is async, `VIPAccessApp` can no longer check `viewModel.isLoaded` synchronously right after calling it — the terminal-error alert is driven by `.onChange(of: viewModel.error)` instead. This required `KeychainError: Equatable`, and `Credential`/`KeychainCredentialStore`/`KeychainError` to be `Sendable` for Swift 6.2 strict concurrency.
+
+## 12. Migration failure paths are hard to reproduce locally — use the debug env toggles
+- **Symptom:** After a successful migration, deleting the app's `com.vipaccess.credential` entries AND `security lock-keychain`-ing the Symantec keychain STILL re-migrates silently. Once the deprecated `SecKeychainUnlock` succeeds once, it re-establishes the keychain ACL/trust for the app's (stable, self-signed) code signature, so later unlocks succeed with no prompt. You cannot reliably force the failure branch just by resetting state.
+- **Fix / workflow:** `LegacyKeychainReader` reads two env-gated debug toggles via `isDebugFlagSet(_:)` (truthy = `1`/`true`/`yes`). They are read from the environment only, so the shipped app is inert unless explicitly launched with them set. **NOTE: they currently ship in the release binary** (so validation uses the same package peers get); wrap in `#if DEBUG` if that ever becomes a concern.
+  - `VIPACCESS_DEBUG_FORCE_CLI_FAILURE=1` — makes the CLI path throw, exercising the fallback + up-front hint (and the deprecated `SecKeychainUnlock`, which may itself show the system dialog).
+  - `VIPACCESS_DEBUG_FORCE_MIGRATION_FAILURE=1` — throws right after the password is derived, exercising the outer "Manual Keychain Unlock Needed" alert in isolation (no deprecated APIs). Cleanest test of the front-most-alert fix from gotcha #10.
+- Launch from the executable so the env var is inherited (double-clicking in Finder does NOT inherit it):
+  `VIPACCESS_DEBUG_FORCE_MIGRATION_FAILURE=1 "build/VIP Access.app/Contents/MacOS/VIPAccess"`
+
+### Manually derive the Symantec keychain password
+The keychain password is `"{serial}SymantecVIPAccess{username}"` where `{serial}` is the IOKit `IOPlatformSerialNumber` and `{username}` is the short login name (`NSUserName()` / `id -un`). It is machine- AND account-specific — run this on the target machine/account. One-liner that reproduces exactly what the app computes:
+```bash
+echo "$(ioreg -c IOPlatformExpertDevice -d 2 | awk -F\" '/IOPlatformSerialNumber/{print $4}')SymantecVIPAccess$(id -un)"
+```
+Derive it and test the unlock in one shot (read-only, non-destructive to the Symantec keychain):
+```bash
+PW="$(ioreg -c IOPlatformExpertDevice -d 2 | awk -F\" '/IOPlatformSerialNumber/{print $4}')SymantecVIPAccess$(id -un)"
+echo "$PW"
+security unlock-keychain -p "$PW" ~/Library/Keychains/VIPAccess.keychain-db && echo UNLOCK_OK || echo UNLOCK_FAIL
+```
+If `UNLOCK_FAIL`, the derivation inputs don't match what Symantec used at provisioning (usually a renamed/different short username, occasionally a differently-formatted serial) — that is the class of failure that leaves a tester stuck and is exactly what the hint alert (gotchas #10–#11) is meant to surface.

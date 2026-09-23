@@ -22,6 +22,25 @@ public enum LegacyKeychainReader {
     /// AES-128-CBC initialization vector: 16 zero bytes.
     private static let aesIV = Data(repeating: 0, count: 16)
 
+    // MARK: - Debug Toggles
+
+    /// Returns true if the named debug environment variable is set to a truthy value
+    /// (`1`, `true`, or `yes`, case-insensitive).
+    ///
+    /// These flags let the migration failure paths be exercised on a machine whose
+    /// keychain state would otherwise let migration succeed silently. They are read
+    /// from the environment, so the shipped app is inert unless explicitly launched
+    /// with the variable set, e.g.:
+    ///
+    ///     VIPACCESS_DEBUG_FORCE_CLI_FAILURE=1 "/Applications/VIP Access.app/Contents/MacOS/VIPAccess"
+    private static func isDebugFlagSet(_ name: String) -> Bool {
+        guard let value = ProcessInfo.processInfo.environment[name]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        else { return false }
+        return value == "1" || value == "true" || value == "yes"
+    }
+
     // MARK: - Public API
 
     /// Reads and decrypts the credential from the Symantec VIPAccess legacy keychain.
@@ -49,66 +68,156 @@ public enum LegacyKeychainReader {
         let username = NSUserName()
         let password = "\(serial)SymantecVIPAccess\(username)"
 
-        // Primary path: CLI-based (/usr/bin/security) — avoids macOS authorization
-        // dialogs that the deprecated SecKeychain* APIs trigger on Tahoe+.
-        let accountData: Data
-        let passwordData: Data
         do {
-            let result = try readFromLegacyKeychainViaCLI(
-                path: keychainPath,
-                password: password
-            )
-            accountData = result.account
-            passwordData = result.password
+            // DEBUG: force the entire migration to fail right after the password is
+            // derived, to validate the outer "Manual Keychain Unlock Needed" alert in
+            // isolation (no deprecated-API path involved). Enable by launching with:
+            //   VIPACCESS_DEBUG_FORCE_MIGRATION_FAILURE=1
+            if isDebugFlagSet("VIPACCESS_DEBUG_FORCE_MIGRATION_FAILURE") {
+                throw KeychainError.credentialReadFailed
+            }
+
+            // Primary path: CLI-based (/usr/bin/security) — avoids macOS authorization
+            // dialogs that the deprecated SecKeychain* APIs trigger on Tahoe+.
+            let accountData: Data
+            let passwordData: Data
+            do {
+                // DEBUG: force the CLI path to fail so the fallback + up-front hint
+                // path runs, matching a machine where the automatic unlock/read
+                // cannot complete. Enable by launching with:
+                //   VIPACCESS_DEBUG_FORCE_CLI_FAILURE=1
+                if isDebugFlagSet("VIPACCESS_DEBUG_FORCE_CLI_FAILURE") {
+                    throw KeychainError.unlockFailed(errSecAuthFailed)
+                }
+
+                let result = try readFromLegacyKeychainViaCLI(
+                    path: keychainPath,
+                    password: password
+                )
+                accountData = result.account
+                passwordData = result.password
+            } catch {
+                // CLI path failed — fall back to deprecated SecKeychain* APIs.
+                // This may trigger a system authorization dialog on macOS Tahoe+.
+                // Show the user the derived password up front so they can enter it
+                // if prompted, before the deprecated unlock puts up the system dialog.
+                showKeychainPasswordHint(
+                    password,
+                    title: "Keychain Authorization Required",
+                    body: """
+                        macOS may prompt you for the "VIPAccess" keychain password. \
+                        The password is:
+
+                        \(password)
+
+                        It has been copied to your clipboard, so you can paste it \
+                        directly into the macOS prompt.
+                        """
+                )
+
+                let result = try readFromLegacyKeychain(
+                    path: keychainPath,
+                    password: password
+                )
+                accountData = result.account
+                passwordData = result.password
+            }
+
+            let decryptedID = try decryptAES128CBC(data: accountData)
+            let decryptedSecret = try decryptAES128CBC(data: passwordData)
+
+            // Strip trailing "Symantec" suffix from the credential ID
+            var id = String(data: decryptedID, encoding: .utf8) ?? ""
+            if id.hasSuffix("Symantec") {
+                id = String(id.dropLast("Symantec".count))
+            }
+
+            let secretBase32 = decryptedSecret.base32EncodedString()
+
+            return Credential(id: id, secret: decryptedSecret, secretBase32: secretBase32)
         } catch {
-            // CLI path failed — fall back to deprecated SecKeychain* APIs.
-            // This may trigger a system authorization dialog on macOS Tahoe+.
-            // Show the user the derived password so they can enter it if prompted.
-            showKeychainPasswordHint(password)
+            // Migration failed for any reason after the derived password was computed
+            // (unlock rejected, read/parse failure, decryption failure, etc.). Surface
+            // the derived password and manual-unlock instructions so the user is never
+            // left stuck — this is the information that actually unblocks a stalled
+            // migration. Then rethrow so the caller still sees the underlying error.
+            showKeychainPasswordHint(
+                password,
+                title: "VIP Access — Manual Keychain Unlock Needed",
+                body: """
+                    VIP Access could not automatically read your Symantec keychain \
+                    (\(error.localizedDescription)).
 
-            let result = try readFromLegacyKeychain(
-                path: keychainPath,
-                password: password
+                    The keychain password for "VIPAccess" is:
+
+                    \(password)
+
+                    It has been copied to your clipboard. To finish setup, unlock the \
+                    keychain manually in Terminal:
+
+                    security unlock-keychain "\(keychainPath)"
+
+                    then paste the password when prompted and relaunch VIP Access.
+                    """
             )
-            accountData = result.account
-            passwordData = result.password
+            throw error
         }
-
-        let decryptedID = try decryptAES128CBC(data: accountData)
-        let decryptedSecret = try decryptAES128CBC(data: passwordData)
-
-        // Strip trailing "Symantec" suffix from the credential ID
-        var id = String(data: decryptedID, encoding: .utf8) ?? ""
-        if id.hasSuffix("Symantec") {
-            id = String(id.dropLast("Symantec".count))
-        }
-
-        let secretBase32 = decryptedSecret.base32EncodedString()
-
-        return Credential(id: id, secret: decryptedSecret, secretBase32: secretBase32)
     }
 
     // MARK: - Keychain File Location
 
-    /// Shows an alert with the derived keychain password so the user can enter it
-    /// if macOS presents its own authorization dialog.
-    private static func showKeychainPasswordHint(_ password: String) {
-        DispatchQueue.main.sync {
-            let alert = NSAlert()
-            alert.messageText = "Keychain Authorization Required"
-            alert.informativeText = """
-                macOS may prompt you for a keychain password. \
-                The password is:
-
-                \(password)
-
-                It has been copied to your clipboard.
-                """
-            alert.alertStyle = .informational
-            alert.addButton(withTitle: "OK")
+    /// Shows an alert with the derived keychain password and copies it to the
+    /// clipboard so the user can complete a manual unlock.
+    ///
+    /// - Important: Two hazards this method guards against:
+    ///   1. **Deadlock:** it must not call `DispatchQueue.main.sync` when already on
+    ///      the main thread — that self-dispatch deadlocks. It detects the current
+    ///      thread and runs the alert directly when already on main.
+    ///   2. **Invisible alert:** this is a menu-bar-only (`LSUIElement`) app, so a
+    ///      modal `NSAlert` shown without `NSApp.activate(ignoringOtherApps:)` is
+    ///      ordered *behind* the frontmost app and the user never sees it. Every
+    ///      other UI entry point in the app activates first for exactly this reason;
+    ///      this presenter does the same before `runModal()`.
+    private static func showKeychainPasswordHint(
+        _ password: String,
+        title: String,
+        body: String
+    ) {
+        @MainActor
+        func present() {
+            // Copy first so the password is on the clipboard even if the user
+            // dismisses the alert quickly.
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(password, forType: .string)
+
+            // Bring this LSUIElement app to the front so the alert is actually
+            // visible instead of being ordered behind the active application.
+            NSApp.activate(ignoringOtherApps: true)
+
+            let alert = NSAlert()
+            alert.messageText = title
+            alert.informativeText = body
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "OK")
+
+            // Belt-and-suspenders: force the alert window itself to the front and
+            // above normal windows, in case activation alone isn't enough.
+            alert.window.level = .modalPanel
+            alert.window.makeKeyAndOrderFront(nil)
+
             alert.runModal()
+        }
+
+        if Thread.isMainThread {
+            // Already on the main thread/actor: run the alert directly.
+            MainActor.assumeIsolated { present() }
+        } else {
+            // Background thread (the normal migration path): hop to the main
+            // queue synchronously so the hint is on screen before the
+            // deprecated SecKeychainUnlock triggers the system prompt.
+            DispatchQueue.main.sync {
+                MainActor.assumeIsolated { present() }
+            }
         }
     }
 

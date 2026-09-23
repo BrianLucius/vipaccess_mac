@@ -18,7 +18,11 @@ struct VIPAccessApp: App {
             .onAppear {
                 appDelegate.viewModel = viewModel
                 viewModel.loadCredential()
-                if !viewModel.isLoaded, let error = viewModel.error {
+            }
+            .onChange(of: viewModel.error) { _, newError in
+                // loadCredential() runs asynchronously, so the terminal failure
+                // arrives here rather than synchronously after the call above.
+                if !viewModel.isLoaded, let error = newError {
                     showErrorAlertAndQuit(error: error)
                 }
             }

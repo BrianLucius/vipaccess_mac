@@ -2,7 +2,7 @@ import Foundation
 import Security
 
 /// Errors that can occur during keychain operations.
-public enum KeychainError: LocalizedError {
+public enum KeychainError: LocalizedError, Equatable, Sendable {
     /// Neither the data protection keychain nor the legacy keychain has a credential.
     case credentialNotFound
     /// No VIPAccess.keychain-db file exists on disk.
@@ -40,7 +40,7 @@ public enum KeychainError: LocalizedError {
 
 /// Manages the app's VIP Access credential in the macOS data protection keychain,
 /// with fallback migration from the Symantec legacy keychain on first launch.
-public class KeychainCredentialStore {
+public final class KeychainCredentialStore: Sendable {
     private static let serviceName = "com.vipaccess.credential"
     private static let secretAccountName = "secret"
     private static let idAccountName = "id"

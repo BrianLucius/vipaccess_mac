@@ -1,7 +1,7 @@
 import Foundation
 
 /// A VIP Access credential containing the identifier and TOTP secret.
-public struct Credential {
+public struct Credential: Sendable {
     /// The credential identifier (e.g., "SYMC12345678").
     public let id: String
     /// The raw secret bytes used for TOTP generation.

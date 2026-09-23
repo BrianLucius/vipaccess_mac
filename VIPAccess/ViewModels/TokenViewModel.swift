@@ -30,21 +30,51 @@ public class TokenViewModel: ObservableObject {
 
     /// Loads the credential from the keychain (data protection first, legacy migration fallback).
     /// On success, initializes the TOTP generator and starts the refresh timer.
+    ///
+    /// The keychain read runs off the main thread. Migration from the legacy Symantec
+    /// keychain shells out to `/usr/bin/security` and may present a password-hint alert;
+    /// running it on a background thread keeps the UI responsive and lets the hint alert
+    /// be pumped on the main thread instead of deadlocking it (see `LegacyKeychainReader`).
     public func loadCredential() {
-        do {
-            let credential = try store.loadCredential()
+        Task {
+            let result = await Self.loadCredentialInBackground(store: store)
+            self.apply(result)
+        }
+    }
+
+    /// Applies the outcome of a background credential load to the published state
+    /// on the main actor.
+    private func apply(_ result: Result<Credential, KeychainError>) {
+        switch result {
+        case .success(let credential):
             self.generator = TOTPGenerator(secret: credential.secret)
             self.credentialID = credential.id
             self.isLoaded = true
             self.error = nil
             refresh()
             startRefresh()
-        } catch let err as KeychainError {
+        case .failure(let err):
             self.error = err
             self.isLoaded = false
-        } catch {
-            self.error = .credentialNotFound
-            self.isLoaded = false
+        }
+    }
+
+    /// Performs the blocking keychain read on a background thread and returns a
+    /// `Result` so the caller can update `@MainActor` state.
+    nonisolated private static func loadCredentialInBackground(
+        store: KeychainCredentialStore
+    ) async -> Result<Credential, KeychainError> {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let credential = try store.loadCredential()
+                    continuation.resume(returning: .success(credential))
+                } catch let err as KeychainError {
+                    continuation.resume(returning: .failure(err))
+                } catch {
+                    continuation.resume(returning: .failure(.credentialNotFound))
+                }
+            }
         }
     }
 
